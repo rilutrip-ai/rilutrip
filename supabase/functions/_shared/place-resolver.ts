@@ -7,6 +7,7 @@ const supabase = createSupabaseAdminClient();
 export interface PlaceInput {
   id: string;
   name: string;
+  place_id?: string;
   lat?: number;
   lng?: number;
 }
@@ -42,6 +43,10 @@ const DETAILS_FIELD_MASK = [
 ].join(",");
 
 const MAX_RETRIES = 3;
+
+// Cap concurrent Google Places calls. 5 is well under per-second quota and
+// avoids 429s while keeping latency low for the common batch size of ~10.
+const RESOLVE_BATCH_SIZE = 5;
 
 function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -233,6 +238,35 @@ async function resolvePlace(input: PlaceInput): Promise<ResolvedPlace> {
   const base: ResolvedPlace = { id: input.id, name: input.name };
 
   if (input.lat === undefined || input.lng === undefined) {
+    if (input.place_id) {
+      const cached = await checkPlaceCache(input.place_id);
+      if (cached) {
+        return {
+          id: input.id,
+          ...normalizeCachedPlace(cached, input.name),
+          place_id: input.place_id,
+        };
+      }
+
+      const details = await getPlaceDetails(input.place_id);
+      if (details) {
+        const displayName = (details.displayName as Record<string, string>)?.text;
+        const location = details.location as Record<string, number>;
+        const data = {
+          place_id: input.place_id,
+          name: displayName ?? input.name,
+          lat: location?.latitude,
+          lng: location?.longitude,
+          rating: (details.rating as number) ?? undefined,
+          user_ratings_total: (details.userRatingCount as number) ?? undefined,
+          website: (details.websiteUri as string) ?? undefined,
+          opening_hours: (details.regularOpeningHours as Record<string, unknown>) ?? undefined,
+        };
+        await savePlaceCache(data);
+        return { id: input.id, ...data };
+      }
+    }
+
     const cachedByName = await checkPlaceCacheByName(input.name);
     if (cachedByName) {
       return {
@@ -287,9 +321,10 @@ async function resolvePlace(input: PlaceInput): Promise<ResolvedPlace> {
 
 export async function resolvePlacesInfo(places: PlaceInput[]): Promise<ResolvedPlace[]> {
   const resolved: ResolvedPlace[] = [];
-  for (const place of places) {
-    const result = await resolvePlace(place);
-    resolved.push(result);
+  for (let i = 0; i < places.length; i += RESOLVE_BATCH_SIZE) {
+    const batch = places.slice(i, i + RESOLVE_BATCH_SIZE);
+    const results = await Promise.all(batch.map(resolvePlace));
+    resolved.push(...results);
   }
   return resolved;
 }
