@@ -28,7 +28,7 @@ export async function generateMetadata({
     title: t("title"),
     description: t("description"),
     icons: {
-      icon: "/logo.svg",
+      icon: "/logo.ico",
     },
     metadataBase: new URL(baseUrl),
     alternates: {
